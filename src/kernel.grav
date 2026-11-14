@@ -1,0 +1,349 @@
+// kernel.grav — ConsoleKernel: the app's CLI. It finds the command a command
+// line names (exactly, by alias, or by abbreviation: `m:c` for make:controller),
+// reads its arguments, runs it, and renders what goes wrong.
+//
+//   let console = new ConsoleKernel(container)
+//   console.add::<SendMail>()                      // or console.discover(): every ConsoleCommand subclass
+//   console.command("inspire", fn(c: ClosureCommand) -> int { c.info("Simplicity is the ultimate sophistication."); return 0 })
+//   Process.exit(console.run(Process.args()))
+//
+// Global options, anywhere on the line: -h/--help, -q/--quiet, -v/-vv/-vvv,
+// -n/--no-interaction, --ansi/--no-ansi, -V/--version, --env=NAME.
+// Built in: list, help, completion (a bash script), _complete (what it calls).
+import "std"
+import "apogee-container"
+import "apogee-events"
+import "apogee-support"
+import "grav-cache"
+import "signature.grav"
+import "output.grav"
+import "command.grav"
+
+namespace apogee {
+
+    class CommandEntry {
+        public name: string
+        public spec: CommandSpec
+        public description: string
+        public hidden: bool
+        public aliases: Array<string>
+        // A class to make for each run, or the one instance (a closure command).
+        public cls: ClassInfo = null
+        public instance: ConsoleCommand = null
+        constructor(name: string, spec: CommandSpec, description: string, hidden: bool, aliases: Array<string>) {
+            self.name = name; self.spec = spec; self.description = description; self.hidden = hidden; self.aliases = aliases;
+        }
+        // (a closure command is described and hidden after it is registered: ask it)
+        fn isHidden() -> bool { return self.instance != null ? self.instance.hidden() : self.hidden; }
+        fn text() -> string { return self.instance != null ? self.instance.description() : self.description; }
+    }
+
+    class CommandStarting {
+        public command: string
+        public arguments: Array<string>
+        constructor(command: string, arguments: Array<string>) { self.command = command; self.arguments = arguments; }
+    }
+    class CommandFinished {
+        public command: string
+        public exitCode: int
+        public ms: long
+        constructor(command: string, exitCode: int, ms: long) { self.command = command; self.exitCode = exitCode; self.ms = ms; }
+    }
+
+    class ConsoleKernel {
+        public container: Container
+        public events: Events = null
+        // For isolated commands' locks.
+        public cache: CacheRepository = null
+        public name: string = "Apogee"
+        public version: string = "1.0.0"
+        // The binary's name in usage lines.
+        public binary: string = "app"
+        // The environment --env named ("" when not given).
+        public environment: string = ""
+        private entries: HashMap<string, CommandEntry>
+        private aliasMap: HashMap<string, string>
+        private last: BufferedOutput = null
+
+        constructor(container: Container) {
+            self.container = container;
+            self.entries = new HashMap<string, CommandEntry>();
+            self.aliasMap = new HashMap<string, string>();
+            container.instance::<ConsoleKernel>(self);
+            self.command("list {namespace? : Only commands of this namespace} {--raw : One command a line}", fn(c: ClosureCommand) -> int { c.kernel.renderList(c); return 0; })
+                .describe("List commands");
+            self.command("help {command_name=help : The command}", fn(c: ClosureCommand) -> int { return c.kernel.renderHelp(c, c.argument("command_name")); })
+                .describe("Display help for a command");
+            self.command("completion {shell=bash}", fn(c: ClosureCommand) -> int { c.output.writeln(c.kernel.completionScript()); return 0; })
+                .describe("Print a shell completion script (eval \"$(app completion)\")");
+            self.command("_complete {words?*}", fn(c: ClosureCommand) -> int { for (w in c.kernel.complete(c.argumentList("words"))) { c.output.writeln(w); } return 0; }).hide();
+        }
+
+        // ── registering ────────────────────────────────────────────────────────
+        fn add<C>() -> ConsoleKernel { return self.addClass(reflect(C)); }
+        fn addClass(cls: ClassInfo) -> ConsoleKernel {
+            let probe = self.container.build(cls) as ConsoleCommand;
+            let spec = CommandSpec.parse(probe.signature());
+            let e = new CommandEntry(spec.name, spec, probe.description(), probe.hidden(), probe.aliases());
+            e.cls = cls;
+            self.register(e);
+            return self;
+        }
+        // Every concrete ConsoleCommand subclass in the program; how many.
+        fn discover() -> int {
+            let n = 0;
+            for (cls in ClassInfo.all(reflect(ConsoleCommand))) {
+                if (!cls.canCreate() && cls.constructors().size() == 0) { continue; }
+                if (cls.name == nameof(ClosureCommand)) { continue; }
+                self.addClass(cls);
+                n += 1;
+            }
+            return n;
+        }
+        // A command written as a function; its ClosureCommand (describe() it).
+        fn command(signature: string, body: fn(ClosureCommand) -> int) -> ClosureCommand {
+            let c = new ClosureCommand();
+            c.sig = signature;
+            c.body = body;
+            let spec = CommandSpec.parse(signature);
+            let e = new CommandEntry(spec.name, spec, "", false, new Array<string>());
+            e.instance = c;
+            self.register(e);
+            return c;
+        }
+        private fn register(e: CommandEntry) {
+            self.entries.put(e.name, e);
+            for (a in e.aliases) { self.aliasMap.put(a, e.name); }
+        }
+        fn has(name: string) -> bool { return self.find(name) != null; }
+        // Every command, sorted by name.
+        fn all() -> Array<CommandEntry> {
+            let names = self.entries.keys();
+            Sort.sort(names);
+            let out = new Array<CommandEntry>();
+            for (n in names) { out.push(self.entries[n]); }
+            return out;
+        }
+        // The command `name` means: exactly, by alias, or by abbreviation (each
+        // part a prefix: "m:con" for make:controller); null when none or several.
+        fn find(name: string) -> CommandEntry {
+            let e = self.entries.getOr(name, null);
+            if (e != null) { return e; }
+            let a = self.aliasMap.getOr(name, "");
+            if (a != "") { return self.entries.getOr(a, null); }
+            let hits = self.abbreviated(name);
+            return hits.size() == 1 ? self.entries[hits[0]] : null;
+        }
+        private fn abbreviated(name: string) -> Array<string> {
+            let want = Str.split(name, ":");
+            let out = new Array<string>();
+            for (n in self.entries.keys()) {
+                let parts = Str.split(n, ":");
+                if (parts.size() != want.size()) { continue; }
+                let ok = true;
+                for (i in 0..parts.size()) { if (!Str.startsWith(parts[i], want[i])) { ok = false; break; } }
+                if (ok && !self.entries[n].isHidden()) { out.push(n); }
+            }
+            Sort.sort(out);
+            return out;
+        }
+
+        // ── running ────────────────────────────────────────────────────────────
+        // Runs a command line (Process.args()); the exit code.
+        fn run(argv: Array<string>) -> int { return self.runWith(argv, ConsoleOutput.standard(), new TerminalInput()); }
+        // Runs a command line, keeping its output for output(); the exit code.
+        fn call(commandLine: string, answers: Array<string> = new Array<string>()) -> int {
+            self.last = new BufferedOutput();
+            return self.runWith(ConsoleKernel.split(commandLine), self.last, new ScriptedInput(answers));
+        }
+        // What the last call() printed.
+        fn output() -> string { return self.last == null ? "" : self.last.text(); }
+
+        fn runWith(argv: Array<string>, out: ConsoleOutput, prompts: ConsoleInput) -> int {
+            let rest = new Array<string>();
+            let help = false;
+            let showVersion = false;
+            let interactive = prompts.interactive();
+            let afterDashes = false;
+            for (t in argv) {
+                if (afterDashes) { rest.push(t); continue; }
+                if (t == "--") { afterDashes = true; rest.push(t); continue; }
+                if (t == "-h" || t == "--help") { help = true; }
+                else if (t == "-q" || t == "--quiet") { out.verbosity = 0; }
+                else if (t == "-v" || t == "--verbose") { out.verbosity = 2; }
+                else if (t == "-vv") { out.verbosity = 3; }
+                else if (t == "-vvv") { out.verbosity = 4; }
+                else if (t == "-n" || t == "--no-interaction") { interactive = false; }
+                else if (t == "--ansi") { out.ansi = true; }
+                else if (t == "--no-ansi") { out.ansi = false; }
+                else if (t == "-V" || t == "--version") { showVersion = true; }
+                else if (Str.startsWith(t, "--env=")) { self.environment = t[6..]; }
+                else { rest.push(t); }
+            }
+            if (showVersion) { out.writeln(self.name + " <info>" + self.version + "</>"); return 0; }
+            if (rest.size() == 0) { rest.push(help ? "help" : "list"); help = false; }
+            let name = rest[0];
+            let entry = self.find(name);
+            if (entry == null) { return self.unknown(name, out); }
+            if (help) { rest = ["help", entry.name]; entry = self.entries["help"]; }
+            let tokens = rest.slice(1, rest.size());
+            let input: ParsedInput = null;
+            try { input = entry.spec.read(tokens); }
+            catch (e: ConsoleUsageException) {
+                out.errorBlock(e.message() + ".");
+                out.writeln("  <comment>Usage:</> " + entry.spec.synopsis());
+                out.newLine();
+                return 1;
+            }
+            let cmd = entry.instance != null ? entry.instance : self.container.build(entry.cls) as ConsoleCommand;
+            cmd.input = input;
+            cmd.output = out;
+            cmd.prompts = prompts;
+            cmd.kernel = self;
+            cmd.interactive = interactive;
+            let lock: CacheLock = null;
+            if (cmd.isolated() && self.cache != null) {
+                lock = self.cache.lock("command:" + entry.name, 86400);
+                if (!lock.get()) { out.warn("The " + entry.name + " command is already running."); return 0; }
+            }
+            if (self.events != null) { self.events.dispatch(new CommandStarting(entry.name, tokens)); }
+            let sw = new Stopwatch();
+            let code = 0;
+            try {
+                let r = entry.instance != null ? (cmd as ClosureCommand).handle() as any : self.container.call(cmd, "handle");
+                if (r is int) { code = r as int; } else if (r is long) { code = (r as long) as int; } else if (r is bool) { code = (r as bool) ? 0 : 1; }
+            } catch (e: ConsoleUsageException) {
+                out.errorBlock(e.message());
+                code = 1;
+            } catch (e: Exception) {
+                out.errorBlock(e.kind() + ": " + e.message());
+                code = 1;
+            } finally {
+                if (lock != null) { lock.release(); }
+            }
+            if (self.events != null) { self.events.dispatch(new CommandFinished(entry.name, code, sw.elapsedMs())); }
+            return code;
+        }
+        private fn unknown(name: string, out: ConsoleOutput) -> int {
+            let several = self.abbreviated(name);
+            if (several.size() > 1) {
+                out.errorBlock("Command \"" + name + "\" is ambiguous. Did you mean one of these?");
+                for (s in several) { out.writeln("    " + s); }
+                return 1;
+            }
+            let close = new Array<string>();
+            for (n in self.entries.keys()) {
+                if (self.entries[n].isHidden()) { continue; }
+                if (Str.levenshtein(n, name) <= 3 || Str.contains(n, name)) { close.push(n); }
+            }
+            Sort.sort(close);
+            out.errorBlock("Command \"" + name + "\" is not defined." + (close.size() > 0 ? " Did you mean " + (close.size() == 1 ? "\"" + close[0] + "\"" : "one of these") + "?" : ""));
+            if (close.size() > 1) { for (s in close) { out.writeln("    " + s); } }
+            return 1;
+        }
+        // A command line split into words, honouring quotes ('…' and "…") and backslashes.
+        static fn split(line: string) -> Array<string> {
+            let out = new Array<string>();
+            let cur = new StringBuilder();
+            let quote = 0;
+            let any = false;
+            let i = 0;
+            while (i < line.length) {
+                let c = line[i] as int;
+                if (quote != 0) {
+                    if (c == quote) { quote = 0; }
+                    else if (c == 92 && quote == 34 && i + 1 < line.length) { i += 1; cur.appendChar(line[i] as int); }
+                    else { cur.appendChar(c); }
+                } else if (c == 39 || c == 34) { quote = c; any = true; }
+                else if (c == 92 && i + 1 < line.length) { i += 1; cur.appendChar(line[i] as int); any = true; }
+                else if (c == 32 || c == 9) {
+                    if (cur.length() > 0 || any) { out.push(cur.toString()); cur.clear(); any = false; }
+                } else { cur.appendChar(c); any = true; }
+                i += 1;
+            }
+            if (cur.length() > 0 || any) { out.push(cur.toString()); }
+            return out;
+        }
+
+        // ── list, help, completion ─────────────────────────────────────────────
+        fn renderList(c: ClosureCommand) {
+            let out = c.output;
+            let ns = c.argument("namespace");
+            let visible = new Array<CommandEntry>();
+            for (e in self.all()) { if (!e.isHidden() && (ns == "" || Str.startsWith(e.name, ns + ":"))) { visible.push(e); } }
+            if (c.flag("raw")) {
+                for (e in visible) { out.writeln(Text.padRight(e.name, 30) + e.text()); }
+                return;
+            }
+            out.writeln(self.name + " <info>" + self.version + "</>");
+            out.newLine();
+            out.writeln("<comment>Usage:</>");
+            out.writeln("  " + self.binary + " command [options] [arguments]");
+            out.newLine();
+            out.writeln("<comment>Options:</>");
+            let globals: Array<Array<string>> = [["-h, --help", "Display help for the given command"], ["-q, --quiet", "Do not output any message"],
+                ["-V, --version", "Display this application version"], ["--ansi|--no-ansi", "Force (or disable) ANSI output"],
+                ["-n, --no-interaction", "Do not ask any interactive question"], ["--env[=ENV]", "The environment the command should run under"],
+                ["-v|vv|vvv, --verbose", "More output: 1 normal, 2 more, 3 debug"]];
+            for (g in globals) { out.writeln("  <info>" + Text.padRight(g[0], 24) + "</> " + g[1]); }
+            out.newLine();
+            out.writeln("<comment>Available commands" + (ns == "" ? "" : " for the \"" + ns + "\" namespace") + ":</>");
+            let width = 0;
+            for (e in visible) { if (e.name.length > width) { width = e.name.length; } }
+            let group = "";
+            for (e in visible) {
+                let g = Str.contains(e.name, ":") ? Text.before(e.name, ":") : "";
+                if (g != group && g != "") { out.writeln(" <comment>" + g + "</>"); }
+                group = g;
+                out.writeln("  <info>" + Text.padRight(e.name, width) + "</>  " + e.text());
+            }
+        }
+        fn renderHelp(c: ClosureCommand, name: string) -> int {
+            let out = c.output;
+            let e = self.find(name);
+            if (e == null) { return self.unknown(name, out); }
+            if (e.text() != "") { out.writeln("<comment>Description:</>"); out.writeln("  " + e.text()); out.newLine(); }
+            out.writeln("<comment>Usage:</>");
+            out.writeln("  " + e.spec.synopsis());
+            for (a in e.aliases) { out.writeln("  " + a); }
+            out.newLine();
+            if (e.spec.arguments.size() > 0) {
+                out.writeln("<comment>Arguments:</>");
+                for (a in e.spec.arguments) {
+                    out.writeln("  <info>" + Text.padRight(a.name, 22) + "</> " + a.description + (a.hasFallback ? " <comment>[default: \"" + a.fallback + "\"]</>" : ""));
+                }
+                out.newLine();
+            }
+            if (e.spec.options.size() > 0) {
+                out.writeln("<comment>Options:</>");
+                for (o in e.spec.options) {
+                    let names = (o.shortcut == "" ? "    " : "-" + o.shortcut + ", ") + "--" + o.name + (o.takesValue ? "=" + Str.upper(o.name) : "") + (o.isArray ? " (multiple)" : "");
+                    out.writeln("  <info>" + Text.padRight(names, 22) + "</> " + o.description + (o.fallback != "" ? " <comment>[default: \"" + o.fallback + "\"]</>" : ""));
+                }
+                out.newLine();
+            }
+            let text = e.cls != null ? (self.container.build(e.cls) as ConsoleCommand).help() : "";
+            if (text != "") { out.writeln("<comment>Help:</>"); out.writeln("  " + text); }
+            return 0;
+        }
+        // What can follow `words` (the command names, or a command's options).
+        fn complete(words: Array<string>) -> Array<string> {
+            let out = new Array<string>();
+            if (words.size() <= 1) {
+                let prefix = words.size() == 0 ? "" : words[0];
+                for (e in self.all()) { if (!e.isHidden() && Str.startsWith(e.name, prefix)) { out.push(e.name); } }
+                return out;
+            }
+            let e = self.find(words[0]);
+            if (e == null) { return out; }
+            let prefix = words[words.size() - 1];
+            for (o in e.spec.options) { let f = "--" + o.name; if (Str.startsWith(f, prefix)) { out.push(f); } }
+            return out;
+        }
+        fn completionScript() -> string {
+            let b = self.binary;
+            let fn_ = "_" + Str.replace(b, "-", "_") + "_complete";
+            return fn_ + "() {\n    local words=(\"\${COMP_WORDS[@]:1}\")\n    COMPREPLY=($(" + b + " _complete -- \"\${words[@]}\" 2>/dev/null))\n}\ncomplete -F " + fn_ + " " + b;
+        }
+    }
+}

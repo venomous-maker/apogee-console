@@ -1,0 +1,162 @@
+// command.grav — ConsoleCommand: a command of the app's CLI, as Laravel's
+// Artisan commands. Give it a signature and a handle() (its parameters come
+// from the container); it reads its arguments and options, prints, and asks.
+//
+//   class SendMail extends ConsoleCommand {
+//       constructor() {}
+//       fn signature() -> string { return "mail:send {user : The user's id} {--queue=default} {--force}" }
+//       fn description() -> string { return "Send the welcome mail" }
+//       fn handle(users: UserRepository) -> int {
+//           let u = users.find(self.argumentInt("user"))
+//           if (!self.flag("force") && !self.confirm("Send to " + u.email + "?", true)) { return 1 }
+//           self.info("Sent.")
+//           return 0
+//       }
+//   }
+import "std"
+import "apogee-support"
+import "signature.grav"
+import "output.grav"
+
+namespace apogee {
+
+    // The base of every command class (its decorator gives them reflection:
+    // the kernel finds them, makes them, and calls handle()).
+    @Console abstract class ConsoleCommand {
+        @Transient public input: ParsedInput = null
+        @Transient public output: ConsoleOutput = null
+        @Transient public prompts: ConsoleInput = null
+        @Transient public kernel: ConsoleKernel = null
+        // (--no-interaction: questions take their defaults)
+        @Transient public interactive: bool = true
+
+        // ── what a command says about itself ───────────────────────────────────
+        fn signature() -> string { return ""; }
+        fn description() -> string { return ""; }
+        // A longer text for `help`.
+        fn help() -> string { return ""; }
+        fn aliases() -> Array<string> { return new Array<string>(); }
+        // Left out of `list` (still runs).
+        fn hidden() -> bool { return false; }
+        // Only one run at a time (a cache lock, when the kernel has a cache): another exits at once.
+        fn isolated() -> bool { return false; }
+
+        // ── arguments and options ──────────────────────────────────────────────
+        fn argument(name: string) -> string { self.known(name, true); return self.input.args.getOr(name, ""); }
+        fn argumentInt(name: string, fallback: long = 0) -> long { return Integer.parseOr(self.argument(name), fallback); }
+        fn hasArgument(name: string) -> bool { return self.input.args.containsKey(name) || self.input.arrays.containsKey(name); }
+        // An array argument ({files*}).
+        fn argumentList(name: string) -> Array<string> { self.known(name, true); return self.input.arrays.getOr(name, new Array<string>()); }
+        fn arguments() -> HashMap<string, string> { return self.input.args; }
+        // An option's value ("" when not given and without a default).
+        fn option(name: string) -> string { self.known(name, false); return self.input.opts.getOr(name, ""); }
+        fn optionInt(name: string, fallback: long = 0) -> long { return Integer.parseOr(self.option(name), fallback); }
+        fn optionFloat(name: string, fallback: double = 0.0) -> double { return Format.toFloatOr(self.option(name), fallback); }
+        // An array option ({--tag=*}): every value given.
+        fn optionList(name: string) -> Array<string> { self.known(name, false); return self.input.optArrays.getOr(name, new Array<string>()); }
+        // A flag ({--force}): given, not given, or --no-force.
+        fn flag(name: string) -> bool { self.known(name, false); return self.input.flags.getOr(name, false); }
+        // Whether the option was on the command line at all.
+        fn hasOption(name: string) -> bool { return self.input.opts.containsKey(name) || self.input.flags.containsKey(name) || self.input.optArrays.containsKey(name); }
+        fn options() -> HashMap<string, string> { return self.input.opts; }
+        private fn known(name: string, argument: bool) {
+            if (argument) { for (a in self.input.spec.arguments) { if (a.name == name) { return; } } }
+            else if (self.input.spec.option(name) != null) { return; }
+            throw new StateError("the command '" + self.input.spec.name + "' has no " + (argument ? "argument" : "option") + " called '" + name + "'");
+        }
+
+        // ── output ──────────────────────────────────────────────────────────────
+        fn line(text: string, style: string = "") { self.output.line(text, style); }
+        fn info(text: string) { self.output.info(text); }
+        fn comment(text: string) { self.output.comment(text); }
+        fn question(text: string) { self.output.question(text); }
+        fn warn(text: string) { self.output.warn(text); }
+        fn error(text: string) { self.output.error(text); }
+        fn newLine(count: int = 1) { self.output.newLine(count); }
+        fn alert(text: string) { self.output.alert(text); }
+        fn table(headers: Array<string>, rows: Array<Array<string>>, style: string = "default") { self.output.table(headers, rows, style); }
+        fn task(description: string, f: fn() -> bool) -> bool { return self.output.task(description, f); }
+        fn twoColumn(first: string, second: string = "") { self.output.twoColumn(first, second); }
+        fn progressBar(total: long) -> ProgressBar { return self.output.progressBar(total); }
+        // Runs `f` for each item, with a progress bar.
+        fn withProgressBar(items: Array<any>, f: fn(any)) {
+            let bar = self.progressBar(items.size() as long);
+            bar.start();
+            for (x in items) { f(x); bar.advance(); }
+            bar.finish();
+        }
+
+        // ── questions ───────────────────────────────────────────────────────────
+        fn ask(question: string, fallback: string = "") -> string {
+            if (!self.interactive) { return fallback; }
+            let a = Str.trim(self.prompt(" <info>" + question + "</>" + (fallback == "" ? "" : " [<comment>" + fallback + "</>]") + "\n > "));
+            return a == "" ? fallback : a;
+        }
+        // An answer that is not shown as it is typed.
+        fn secret(question: string) -> string {
+            if (!self.interactive) { return ""; }
+            self.output.write(" <info>" + question + "</>\n > ");
+            return self.prompts.readSecret("");
+        }
+        fn confirm(question: string, fallback: bool = false) -> bool {
+            if (!self.interactive) { return fallback; }
+            let a = Str.lower(Str.trim(self.prompt(" <info>" + question + "</> (yes/no) [<comment>" + (fallback ? "yes" : "no") + "</>]\n > ")));
+            if (a == "") { return fallback; }
+            return a == "y" || a == "yes" || a == "true" || a == "1";
+        }
+        // One of `choices` (by its text or number); the default by index.
+        fn choice(question: string, choices: Array<string>, fallbackIndex: int = -1) -> string {
+            let fallback = fallbackIndex >= 0 && fallbackIndex < choices.size() ? choices[fallbackIndex] : "";
+            if (!self.interactive) { return fallback; }
+            let prompt = new StringBuilder();
+            prompt.append(" <info>" + question + "</>" + (fallback == "" ? "" : " [<comment>" + fallback + "</>]") + "\n");
+            for (i, c in choices) { prompt.append("  [<comment>${i}</>] " + c + "\n"); }
+            prompt.append(" > ");
+            for (attempt in 0..3) {
+                let a = Str.trim(self.prompt(prompt.toString()));
+                if (a == "" && fallback != "") { return fallback; }
+                let n = Integer.parseOr(a, -1) as int;
+                if (n >= 0 && n < choices.size() && Str.isDigits(a)) { return choices[n]; }
+                for (c in choices) { if (Str.lower(c) == Str.lower(a)) { return c; } }
+                self.error("  Value \"" + a + "\" is invalid");
+            }
+            throw new ConsoleUsageException("no valid answer to \"" + question + "\"");
+        }
+        // A free answer, with `suggestions` completing a prefix ("ad" -> "admin" when only one starts so).
+        fn anticipate(question: string, suggestions: Array<string>, fallback: string = "") -> string {
+            let a = self.ask(question, fallback);
+            let hits = new Array<string>();
+            for (s in suggestions) { if (Str.startsWith(Str.lower(s), Str.lower(a))) { hits.push(s); } }
+            return hits.size() == 1 && a != "" ? hits[0] : a;
+        }
+
+        // (the question goes through the output, so tests and logs see it too)
+        private fn prompt(text: string) -> string {
+            self.output.write(text);
+            IO.flush();
+            return self.prompts.readLine("");
+        }
+
+        // ── other commands ──────────────────────────────────────────────────────
+        // Runs another command with this one's output; its exit code.
+        fn call(commandLine: string) -> int { return self.kernel.runWith(ConsoleKernel.split(commandLine), self.output, self.prompts); }
+        // Runs another command, its output dropped.
+        fn callSilently(commandLine: string) -> int { return self.kernel.runWith(ConsoleKernel.split(commandLine), new BufferedOutput(), self.prompts); }
+    }
+
+    // A command written as a function: kernel.command("greet {name}", fn(c: ClosureCommand) -> int { … }).
+    class ClosureCommand extends ConsoleCommand {
+        public sig: string = ""
+        public text: string = ""
+        public body: fn(ClosureCommand) -> int = null
+        public isHidden: bool = false
+        constructor() {}
+        fn signature() -> string { return self.sig; }
+        fn description() -> string { return self.text; }
+        fn hidden() -> bool { return self.isHidden; }
+        // Sets the description (`list` shows it).
+        fn describe(text: string) -> ClosureCommand { self.text = text; return self; }
+        fn hide() -> ClosureCommand { self.isHidden = true; return self; }
+        fn handle() -> int { return self.body(self); }
+    }
+}
