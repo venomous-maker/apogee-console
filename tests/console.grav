@@ -1,0 +1,182 @@
+// apogee-console's tests: signatures and command lines, output (tags, tables,
+// components, verbosity), questions, finding commands (aliases, abbreviations,
+// suggestions), list/help/completion, container injection, isolation, events.
+import "std"
+import "../src/all.grav"
+use apogee.*
+
+class Mailer { public sent: Array<string> = new Array<string>()  constructor() {} }
+
+class SendMail extends ConsoleCommand {
+    constructor() {}
+    fn signature() -> string { return "mail:send {user : The user's id} {cc?*} {--Q|queue=default : The queue} {--force} {--tag=* : Tags}" }
+    fn description() -> string { return "Send a mail" }
+    fn aliases() -> Array<string> { return ["send"] }
+    fn handle(m: Mailer) -> int {
+        if (!self.flag("force") && !self.confirm("Really?", false)) { self.warn("Not sent."); return 1 }
+        m.sent.push("${self.argumentInt("user")} via " + self.option("queue") + " cc " + Str.join(self.argumentList("cc"), "+") + " tags " + Str.join(self.optionList("tag"), "+"))
+        self.info("Sent to ${self.argument("user")}.")
+        return 0
+    }
+}
+class Wizard extends ConsoleCommand {
+    constructor() {}
+    fn signature() -> string { return "make:wizard" }
+    fn handle() {
+        let name = self.ask("Name?", "ada")
+        let pw = self.secret("Password?")
+        let role = self.choice("Role?", ["admin", "editor", "viewer"], 2)
+        let lang = self.anticipate("Language?", ["grav", "go", "rust"])
+        self.line(name + "/" + pw + "/" + role + "/" + lang)
+    }
+}
+class Boom extends ConsoleCommand {
+    constructor() {}
+    fn signature() -> string { return "boom" }
+    fn handle() { throw new StateError("it broke") }
+}
+class Solo extends ConsoleCommand {
+    constructor() {}
+    fn signature() -> string { return "solo" }
+    fn isolated() -> bool { return true }
+    fn handle() -> int { return self.call("send 1 --force") }
+}
+
+fn console() -> ConsoleKernel {
+    let c = new Container()
+    c.singleton::<Mailer>(fn(c: Container) -> Mailer { return new Mailer() })
+    let k = new ConsoleKernel(c)
+    k.binary = "app"
+    k.add::<SendMail>()
+    k.add::<Wizard>()
+    k.add::<Boom>()
+    k.add::<Solo>()
+    k.command("greet {name=world} {--shout}", fn(cmd: ClosureCommand) -> int {
+        let s = "Hello, " + cmd.argument("name") + "!"
+        cmd.line(cmd.flag("shout") ? Str.upper(s) : s)
+        return 0
+    }).describe("Say hello")
+    return k
+}
+
+test "signatures: arguments, options, shortcuts, arrays, defaults, descriptions" {
+    let s = CommandSpec.parse("mail:send {user : The id} {cc?*} {--Q|queue=default : The queue} {--force} {--tag=*} {--level=}")
+    assertEq("${s.name} ${s.arguments.size()} ${s.options.size()} ${s.arguments[0].description} ${s.arguments[1].isArray} ${s.option("queue").shortcut} ${s.option("queue").fallback}", "mail:send 2 4 The id true Q default")
+    let p = s.read(["7", "a@x", "b@x", "-Qhigh", "--tag=x", "--tag", "y", "--force", "--level=3"])
+    assertEq("${p.args["user"]} ${p.arrays["cc"]} ${p.opts["queue"]} ${p.optArrays["tag"]} ${p.flags["force"]} ${p.opts["level"]}", "7 [\"a@x\", \"b@x\"] high [\"x\", \"y\"] true 3")
+    let q = s.read(["7", "--no-force", "--", "--literal"])
+    assertEq("${q.flags["force"]} ${q.arrays["cc"]} ${q.opts["queue"]}", "false [\"--literal\"] default")
+    let e1 = ""
+    try { s.read(["7", "--forse"]) } catch (e: ConsoleUsageException) { e1 = e.message() }
+    assertEq(e1, "the option '--forse' does not exist. Did you mean --force?")
+    let e2 = ""
+    try { s.read([]) } catch (e: ConsoleUsageException) { e2 = e.message() }
+    assertEq(e2, "not enough arguments (missing: \"user\")")
+    let e3 = ""
+    try { CommandSpec.parse("x {a?} {b}") } catch (e: ValueError) { e3 = e.message() }
+    assertEq(Str.contains(e3, "follows an optional one"), true)
+    assertEq(s.synopsis(), "mail:send [options] <user> [<cc>...]")
+    assertEq(Str.join(ConsoleKernel.split("send 1 'two words' \"say \\\"hi\\\"\" a\\ b"), "|"), "send|1|two words|say \"hi\"|a b")
+}
+
+test "running: injection, exit codes, aliases, abbreviations, questions" {
+    let k = console()
+    assertEq(k.call("mail:send 7 a@x --force -Q mail --tag=vip"), 0)
+    assertEq(k.output(), "Sent to 7.\n")
+    let m = k.container.make::<Mailer>()
+    assertEq(m.sent[0], "7 via mail cc a@x tags vip")
+    assertEq(k.call("send 8", ["no"]), 1)                        // an alias; the question answered "no"
+    assertEq(k.output(), " Really? (yes/no) [no]\n > Not sent.\n")
+    assertEq(k.call("m:s 9 -n"), 1)                              // abbreviated; -n takes the default
+    assertEq(k.call("gr Ada --shout"), 0)
+    assertEq(k.output(), "HELLO, ADA!\n")
+    assertEq(k.call("make:wizard", ["", "s3cret", "1", "gr"]), 0)
+    assertEq(Str.endsWith(k.output(), "ada/s3cret/editor/grav\n"), true)
+    assertEq(k.call("make:wizard -n"), 0)
+    assertEq(k.output(), "ada//viewer/\n")
+}
+
+test "errors: unknown and ambiguous commands, bad input, exceptions" {
+    let k = console()
+    assertEq(k.call("mial:send"), 1)
+    assertEq(Str.contains(k.output(), "Command \"mial:send\" is not defined. Did you mean \"mail:send\"?"), true)
+    k.command("make:widget", fn(c: ClosureCommand) -> int { return 0 })
+    assertEq(k.call("make:wi"), 1)
+    assertEq(Str.contains(k.output(), "is ambiguous") && Str.contains(k.output(), "make:widget") && Str.contains(k.output(), "make:wizard"), true)
+    assertEq(k.call("mail:send"), 1)
+    assertEq(Str.contains(k.output(), "not enough arguments (missing: \"user\").") && Str.contains(k.output(), "Usage: mail:send [options] <user> [<cc>...]"), true)
+    assertEq(k.call("boom"), 1)
+    assertEq(Str.contains(k.output(), "ERROR  StateError: it broke"), true)
+}
+
+test "list, help, version, completion" {
+    let k = console()
+    k.call("list")
+    let out = k.output()
+    assertEq(Str.startsWith(out, "Apogee 1.0.0\n"), true)
+    assertEq(Str.contains(out, " mail\n  mail:send    Send a mail"), true)
+    assertEq(Str.contains(out, "_complete"), false)              // hidden
+    k.call("list make --raw")
+    assertEq(Str.trim(k.output()), "make:wizard")
+    k.call("help mail:send")
+    let h = k.output()
+    assertEq(Str.contains(h, "Usage:\n  mail:send [options] <user> [<cc>...]\n  send"), true)
+    assertEq(Str.contains(h, "-Q, --queue=QUEUE") && Str.contains(h, "[default: \"default\"]") && Str.contains(h, "--tag=TAG (multiple)"), true)
+    k.call("mail:send --help")
+    assertEq(Str.contains(k.output(), "Description:\n  Send a mail"), true)
+    k.call("-V")
+    assertEq(k.output(), "Apogee 1.0.0\n")
+    k.call("_complete ma")
+    assertEq(Str.trim(k.output()), "mail:send\nmake:wizard")
+    k.call("_complete -- mail:send --q")
+    assertEq(Str.trim(k.output()), "--queue")
+    k.call("completion")
+    assertEq(Str.contains(k.output(), "complete -F _app_complete app"), true)
+}
+
+test "output: style tags, verbosity, tables, components, progress" {
+    let o = new BufferedOutput()
+    o.writeln("<info>ok</> <comment>note</> <fg=red;options=bold>loud</> a \\<b> c")
+    assertEq(o.fetch(), "ok note loud a <b> c\n")
+    o.ansi = true
+    o.writeln("<info>ok</>")
+    assertEq(o.fetch(), "\e[32mok\e[0m\n")
+    o.ansi = false
+    o.verbosity = 1
+    o.verbose("hidden"); o.writeln("shown")
+    assertEq(o.fetch(), "shown\n")
+    o.table(["Name", "Age"], [["Ada", "36"], ["Bob", "7"]])
+    assertEq(o.fetch(), "+------+-----+\n| Name | Age |\n+------+-----+\n| Ada  | 36  |\n| Bob  | 7   |\n+------+-----+\n")
+    o.table(["N"], [["é"]], "box")
+    assertEq(o.fetch(), "┌───┐\n│ N │\n├───┤\n│ é │\n└───┘\n")
+    o.table(["A", "B"], [["1", "2"]], "markdown")
+    assertEq(o.fetch(), "| A | B |\n|---|---|\n| 1 | 2 |\n")
+    o.width = 30
+    assertEq(o.task("Migrating", fn() -> bool { return true }), true)
+    let line = o.fetch()
+    assertEq(Str.startsWith(line, "  Migrating ....") && Str.endsWith(line, "ms DONE\n"), true)
+    o.infoBlock("Ready.")
+    assertEq(o.fetch(), "\n   INFO  Ready.\n\n")                  // (the badge is padded: " INFO " on its colour)
+    let bar = o.progressBar(4)
+    bar.start(); bar.advance(); bar.advance(3); bar.finish()
+    let p = o.fetch()
+    assertEq(Str.contains(p, " 0/4 [") && Str.contains(p, " 4/4 [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] 100%"), true)
+    o.verbosity = 0
+    o.writeln("nothing"); o.error("nor this")
+    assertEq(o.fetch(), "")
+}
+
+test "isolated commands, calling other commands, events" {
+    let k = console()
+    k.cache = new CacheRepository(new MemoryCacheStore())
+    let ev = new Events(k.container)
+    k.events = ev
+    let seen = new Array<string>()
+    ev.listen::<CommandFinished>(fn(e: CommandFinished) { seen.push(e.command + "=${e.exitCode}") })
+    assertEq(k.call("solo"), 0)                                  // which calls mail:send
+    assertEq(k.output(), "Sent to 1.\n")
+    assertEq(Str.join(seen, ","), "mail:send=0,solo=0")
+    k.cache.lock("command:solo", 60).get()                       // as if another run held it
+    assertEq(k.call("solo"), 0)
+    assertEq(k.output(), "The solo command is already running.\n")
+}
