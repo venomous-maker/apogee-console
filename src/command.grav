@@ -17,6 +17,7 @@ import "std"
 import "apogee-support"
 import "signature.grav"
 import "output.grav"
+import "kernel.grav"
 
 namespace apogee {
 
