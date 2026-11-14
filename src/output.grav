@@ -1,0 +1,299 @@
+// output.grav — what commands print, and how they ask.
+//
+// ConsoleOutput writes lines with style tags (<info>, <comment>, <error>,
+// <question>, <b>, <u>, <fg=red;bg=white;options=bold>…</>), turned into
+// colours on a terminal and dropped elsewhere; verbosity (-q … -vvv);
+// tables; progress bars; Laravel's components (task "…… DONE", two columns,
+// info/warn/error blocks). BufferedOutput keeps everything for tests.
+// ConsoleInput answers questions: the terminal, or a list of answers.
+import "std"
+import "apogee-support"
+
+namespace apogee {
+
+    class Verbosity {
+        static fn quiet() -> int { return 0; }
+        static fn normal() -> int { return 1; }
+        static fn verbose() -> int { return 2; }
+        static fn veryVerbose() -> int { return 3; }
+        static fn debug() -> int { return 4; }
+    }
+
+    class ConsoleOutput {
+        public ansi: bool
+        public verbosity: int = 1
+        // Where text goes (stdout by default; errors to stderr).
+        private sink: fn(string)
+        private errSink: fn(string)
+        // Characters written on the current line (for progress redraws).
+        public width: int = 80
+
+        constructor(ansi: bool = false) {
+            self.ansi = ansi;
+            self.sink = fn(s: string) { IO.write(s); };
+            self.errSink = fn(s: string) { IO.eprint(Str.endsWith(s, "\n") ? s[..s.length - 1] : s); };
+            self.width = Term.width();
+        }
+        // stdout and stderr, with colours when they are a terminal.
+        static fn standard() -> ConsoleOutput { return new ConsoleOutput(Term.supportsColor()); }
+        fn to(sink: fn(string)) -> ConsoleOutput { self.sink = sink; self.errSink = sink; return self; }
+
+        fn isQuiet() -> bool { return self.verbosity == 0; }
+        fn isVerbose() -> bool { return self.verbosity >= 2; }
+        fn isVeryVerbose() -> bool { return self.verbosity >= 3; }
+        fn isDebug() -> bool { return self.verbosity >= 4; }
+
+        // ── writing ─────────────────────────────────────────────────────────────
+        // `text` (style tags applied) without a newline, when the verbosity allows.
+        fn write(text: string, level: int = 1) { if (self.verbosity >= level) { self.sink(self.format(text)); } }
+        fn writeln(text: string = "", level: int = 1) { if (self.verbosity >= level) { self.sink(self.format(text) + "\n"); } }
+        fn writeError(text: string) { if (self.verbosity > 0) { self.errSink(self.format(text) + "\n"); } }
+        fn newLine(count: int = 1) { if (self.verbosity > 0) { self.sink(Str.repeat("\n", count)); } }
+        fn line(text: string, style: string = "", level: int = 1) {
+            self.writeln(style == "" ? text : "<" + style + ">" + ConsoleOutput.escape(text) + "</>", level);
+        }
+        fn info(text: string) { self.line(text, "info"); }
+        fn comment(text: string) { self.line(text, "comment"); }
+        fn question(text: string) { self.line(text, "question"); }
+        fn warn(text: string) { self.line(text, "warning"); }
+        fn error(text: string) { if (self.verbosity > 0) { self.errSink(self.format("<error>" + ConsoleOutput.escape(text) + "</>") + "\n"); } }
+        // Only with -v (or -vv, -vvv).
+        fn verbose(text: string) { self.writeln(text, 2); }
+        fn debug(text: string) { self.writeln(text, 4); }
+
+        // A message `<` and `>` in which are text, not tags.
+        static fn escape(text: string) -> string { return Str.replace(text, "<", "\\<"); }
+
+        // ── style tags ──────────────────────────────────────────────────────────
+        // Applies (or, without ANSI, strips) the style tags; "\<" is a literal "<".
+        fn format(text: string) -> string {
+            if (!Str.contains(text, "<")) { return text; }
+            let sb = new StringBuilder();
+            let stack = new Array<string>();
+            let i = 0;
+            let n = text.length;
+            while (i < n) {
+                let c = text[i] as int;
+                if (c == 92 && i + 1 < n && text[i + 1] as int == 60) { sb.appendChar(60); i += 2; continue; }
+                if (c == 60) {
+                    let close = Str.indexFrom(text, ">", i);
+                    let tag = close > i ? text[i + 1..close] : "";
+                    let codes = close > i ? ConsoleOutput.codes(tag) : "!";
+                    if (tag == "/" || (Str.startsWith(tag, "/") && ConsoleOutput.codes(tag[1..]) != "!")) {
+                        if (stack.size() > 0) { stack.pop(); }
+                        if (self.ansi) { sb.append("\e[0m"); for (s in stack) { sb.append(s); } }
+                        i = close + 1;
+                        continue;
+                    }
+                    if (codes != "!") {
+                        let esc = "\e[" + codes + "m";
+                        stack.push(esc);
+                        if (self.ansi) { sb.append(esc); }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                sb.appendChar(c);
+                i += 1;
+            }
+            if (self.ansi && stack.size() > 0) { sb.append("\e[0m"); }
+            return sb.toString();
+        }
+        // The ANSI codes of a tag, "!" when it is not one.
+        private static fn codes(tag: string) -> string {
+            if (tag == "info") { return "32"; }
+            if (tag == "comment") { return "33"; }
+            if (tag == "warning") { return "33"; }
+            if (tag == "error") { return "37;41"; }
+            if (tag == "question") { return "30;46"; }
+            if (tag == "b" || tag == "bold") { return "1"; }
+            if (tag == "u" || tag == "underline") { return "4"; }
+            if (tag == "dim" || tag == "muted") { return "2"; }
+            if (!Str.contains(tag, "=")) { return "!"; }
+            let out = new Array<string>();
+            for (part in Str.split(tag, ";")) {
+                let eq = Str.indexOf(part, "=");
+                if (eq < 0) { return "!"; }
+                let k = part[..eq];
+                let v = part[eq + 1..];
+                if (k == "fg" || k == "bg") {
+                    let base = ConsoleOutput.color(v);
+                    if (base < 0) { return "!"; }
+                    out.push("${base + (k == "bg" ? 10 : 0)}");
+                } else if (k == "options") {
+                    for (o in Str.split(v, ",")) {
+                        if (o == "bold") { out.push("1"); } else if (o == "underscore" || o == "underline") { out.push("4"); }
+                        else if (o == "reverse") { out.push("7"); } else if (o == "blink") { out.push("5"); } else { return "!"; }
+                    }
+                } else { return "!"; }
+            }
+            return Str.join(out, ";");
+        }
+        private static fn color(name: string) -> int {
+            let names: Array<string> = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+            let i = names.indexOf(name);
+            if (i >= 0) { return 30 + i; }
+            if (Str.startsWith(name, "bright-")) { let j = names.indexOf(name[7..]); return j >= 0 ? 90 + j : -1; }
+            if (name == "gray" || name == "grey") { return 90; }
+            if (name == "default") { return 39; }
+            return -1;
+        }
+
+        // ── components ──────────────────────────────────────────────────────────
+        //   INFO  Message.
+        fn infoBlock(text: string) { self.block("INFO", "fg=white;bg=blue", text); }
+        fn warnBlock(text: string) { self.block("WARN", "fg=black;bg=yellow", text); }
+        fn errorBlock(text: string) { self.block("ERROR", "fg=white;bg=red", text); }
+        fn successBlock(text: string) { self.block("DONE", "fg=white;bg=green", text); }
+        private fn block(label: string, style: string, text: string) {
+            self.newLine();
+            self.writeln("  <" + style + "> " + label + " </> " + ConsoleOutput.escape(text));
+            self.newLine();
+        }
+        // A framed alert:
+        //   *********
+        //   *  Text *
+        //   *********
+        fn alert(text: string) {
+            let bar = Str.repeat("*", text.length + 12);
+            self.comment(bar);
+            self.comment("*     " + text + "     *");
+            self.comment(bar);
+            self.newLine();
+        }
+        // "first ........... second", across the width.
+        fn twoColumn(first: string, second: string = "") {
+            let visible = self.stripped(first).length + self.stripped(second).length;
+            let dots = self.width - visible - 6;
+            self.writeln("  " + first + " <fg=gray>" + Str.repeat(".", dots < 1 ? 1 : dots) + "</> " + second);
+        }
+        // Runs `task`, then prints "  description ..... 12ms DONE" (or FAIL); whether it succeeded.
+        fn task(description: string, task: fn() -> bool) -> bool {
+            let sw = new Stopwatch();
+            let ok = false;
+            let error = "";
+            try { ok = task(); } catch (e: Exception) { error = e.message(); }
+            let status = ok ? "<fg=green;options=bold>DONE</>" : "<fg=red;options=bold>FAIL</>";
+            self.twoColumn(description, "<fg=gray>${sw.elapsedMs()}ms</> " + status);
+            if (error != "") { self.error("  " + error); }
+            return ok;
+        }
+        fn bulletList(items: Array<string>) { for (it in items) { self.writeln("  <fg=gray>⇂</> " + it); } }
+        // Style tags taken out (for measuring).
+        fn stripped(text: string) -> string { let a = self.ansi; self.ansi = false; let s = self.format(text); self.ansi = a; return s; }
+
+        // ── tables ──────────────────────────────────────────────────────────────
+        // A table with a header row; `style` "box" (lines), "compact" (no lines), "markdown" or "default" (+-|).
+        fn table(headers: Array<string>, rows: Array<Array<string>>, style: string = "default") {
+            let cols = headers.size();
+            for (r in rows) { if (r.size() > cols) { cols = r.size(); } }
+            let widths = new Array<int>();
+            for (c in 0..cols) {
+                let w = c < headers.size() ? Text.length(self.stripped(headers[c])) : 0;
+                for (r in rows) { if (c < r.size()) { let l = Text.length(self.stripped(r[c])); if (l > w) { w = l; } } }
+                widths.push(w);
+            }
+            let cell = fn(text: string, w: int) -> string { return text + Str.repeat(" ", w - Text.length(self.stripped(text))); };
+            let rowLine = fn(cells: Array<string>, sep: string, edge: string) -> string {
+                let parts = new Array<string>();
+                for (c in 0..cols) { parts.push(" " + cell(c < cells.size() ? cells[c] : "", widths[c]) + " "); }
+                return edge + Str.join(parts, sep) + edge;
+            };
+            let rule = fn(left: string, mid: string, right: string, fill: string) -> string {
+                let parts = new Array<string>();
+                for (w in widths) { parts.push(Str.repeat(fill, w + 2)); }
+                return left + Str.join(parts, mid) + right;
+            };
+            let headerCells = new Array<string>();
+            for (h in headers) { headerCells.push("<info>" + h + "</>"); }
+            if (style == "compact") {
+                self.writeln(rowLine(headerCells, "", ""));
+                for (r in rows) { self.writeln(rowLine(r, "", "")); }
+                return;
+            }
+            if (style == "markdown") {
+                self.writeln(rowLine(headers, "|", "|"));
+                self.writeln(rule("|", "|", "|", "-"));
+                for (r in rows) { self.writeln(rowLine(r, "|", "|")); }
+                return;
+            }
+            let box = style == "box";
+            self.writeln(box ? rule("┌", "┬", "┐", "─") : rule("+", "+", "+", "-"));
+            self.writeln(rowLine(headerCells, box ? "│" : "|", box ? "│" : "|"));
+            self.writeln(box ? rule("├", "┼", "┤", "─") : rule("+", "+", "+", "-"));
+            for (r in rows) { self.writeln(rowLine(r, box ? "│" : "|", box ? "│" : "|")); }
+            self.writeln(box ? rule("└", "┴", "┘", "─") : rule("+", "+", "+", "-"));
+        }
+
+        // A progress bar for `total` steps.
+        fn progressBar(total: long) -> ProgressBar { return new ProgressBar(self, total); }
+    }
+
+    // Everything written, kept (for tests and `kernel.output()`).
+    class BufferedOutput extends ConsoleOutput {
+        private buffer: StringBuilder
+        constructor() {
+            super(false);
+            self.buffer = new StringBuilder();
+            let b = self.buffer;
+            self.to(fn(s: string) { b.append(s); });
+            self.width = 80;
+        }
+        fn fetch() -> string { let s = self.buffer.toString(); self.buffer.clear(); return s; }
+        fn text() -> string { return self.buffer.toString(); }
+    }
+
+    //   let bar = out.progressBar(rows.size())
+    //   bar.start()
+    //   for (r in rows) { import(r); bar.advance() }
+    //   bar.finish()
+    class ProgressBar {
+        public total: long
+        public current: long = 0
+        public message: string = ""
+        public barWidth: int = 28
+        private out: ConsoleOutput
+        private started: Stopwatch
+        private lastDraw: long = -1
+        constructor(out: ConsoleOutput, total: long) { self.out = out; self.total = total; self.started = new Stopwatch(); }
+        fn start() { self.started.reset(); self.draw(true); }
+        fn advance(step: long = 1) { self.setProgress(self.current + step); }
+        fn setProgress(n: long) { self.current = n > self.total && self.total > 0 ? self.total : n; self.draw(false); }
+        fn setMessage(m: string) { self.message = m; }
+        fn finish() { self.current = self.total > 0 ? self.total : self.current; self.draw(true); self.out.newLine(); }
+        private fn draw(force: bool) {
+            if (self.out.isQuiet()) { return; }
+            // (at most every 1% when drawing on a terminal, every 10% otherwise)
+            let pct = self.total > 0 ? (self.current * 100) / self.total : 0;
+            let step = self.out.ansi ? 1 : 10;
+            if (!force && pct / step == self.lastDraw / step && self.current != self.total) { return; }
+            self.lastDraw = pct;
+            let filled = self.total > 0 ? ((self.current * (self.barWidth as long)) / self.total) as int : 0;
+            let bar = Str.repeat("▓", filled) + Str.repeat("░", self.barWidth - filled);
+            let line = " ${self.current}/${self.total} [" + bar + "] ${pct}%  " + Number.format(self.started.elapsedSeconds(), 1) + "s" + (self.message == "" ? "" : "  " + self.message);
+            if (self.out.ansi) { self.out.write("\r\e[2K" + line); } else { self.out.writeln(line); }
+        }
+    }
+
+    // Where answers to questions come from.
+    interface ConsoleInput {
+        fn readLine(prompt: string) -> string
+        fn readSecret(prompt: string) -> string
+        fn interactive() -> bool
+    }
+    class TerminalInput implements ConsoleInput {
+        constructor() {}
+        fn readLine(prompt: string) -> string { IO.write(prompt); IO.flush(); return input(); }
+        fn readSecret(prompt: string) -> string { return Term.readHidden(prompt); }
+        fn interactive() -> bool { return Term.isInteractive(); }
+    }
+    // Answers given in advance (tests, --no-interaction runs that script them).
+    class ScriptedInput implements ConsoleInput {
+        private answers: Array<string>
+        public asked: Array<string>
+        constructor(answers: Array<string>) { self.answers = answers; self.asked = new Array<string>(); }
+        fn readLine(prompt: string) -> string { self.asked.push(prompt); return self.answers.size() > 0 ? self.answers.removeAt(0) : ""; }
+        fn readSecret(prompt: string) -> string { return self.readLine(prompt); }
+        fn interactive() -> bool { return true; }
+    }
+}
