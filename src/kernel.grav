@@ -137,12 +137,12 @@ namespace apogee {
         private fn abbreviated(name: string) -> Array<string> {
             let want = Str.split(name, ":");
             let out = new Array<string>();
-            for (n in self.entries.keys()) {
+            for ((n, entry) in self.entries) {
                 let parts = Str.split(n, ":");
                 if (parts.size() != want.size()) { continue; }
                 let ok = true;
                 for (i in 0..parts.size()) { if (!Str.startsWith(parts[i], want[i])) { ok = false; break; } }
-                if (ok && !self.entries[n].isHidden()) { out.push(n); }
+                if (ok && !entry.isHidden()) { out.push(n); }
             }
             Sort.sort(out);
             return out;
@@ -232,8 +232,8 @@ namespace apogee {
                 return 1;
             }
             let close = new Array<string>();
-            for (n in self.entries.keys()) {
-                if (self.entries[n].isHidden()) { continue; }
+            for ((n, entry) in self.entries) {
+                if (entry.isHidden()) { continue; }
                 if (Str.levenshtein(n, name) <= 3 || Str.contains(n, name)) { close.push(n); }
             }
             Sort.sort(close);
