@@ -9,7 +9,7 @@ Laravel's Artisan. It has:
 - lookup by name, alias or abbreviation, with "did you mean" suggestions
 - `list`, `help`, bash completion, isolated commands and events
 
-```grav
+```typescript
 import "std"
 import "apogee-console"
 
@@ -60,7 +60,7 @@ In `handle()`:
 
 ## Output
 
-```grav
+```typescript
 self.info("Done.")  self.comment("…")  self.warn("…")  self.error("…")  self.line("…", "question")
 self.output.writeln("<info>green</> <comment>yellow</> <fg=red;bg=white;options=bold>loud</> \\<literal>")
 self.table(["Name", "Email"], rows)                    // "default" (+-|), "box", "compact", "markdown"
@@ -81,7 +81,7 @@ self.withProgressBar(items, fn(x: any) { process(x) })
 
 ## Questions
 
-```grav
+```typescript
 let name = self.ask("Name?", "ada")
 let pw = self.secret("Password?")                     // not shown as it is typed
 let sure = self.confirm("Continue?", false)
@@ -115,7 +115,7 @@ With `-n` (`--no-interaction`), every question takes its default.
 
 ## Testing
 
-```grav
+```typescript
 assertEq(console.call("mail:send 7 --force"), 0)
 assertEq(console.output(), "Sent.\n")
 console.call("make:wizard", ["Ada", "s3cret", "1"])    // the answers, in order
